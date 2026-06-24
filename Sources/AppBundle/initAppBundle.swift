@@ -2,7 +2,27 @@ import AppKit
 import Common
 import Foundation
 
+@MainActor
+private func checkFocusPrivateApiCrashGuard() {
+    if UserDefaults.standard.bool(forKey: privateApiInUseKey) {
+        // Previous session crashed inside the private API focus call.
+        // Permanently disable the private API workaround.
+        UserDefaults.standard.set(true, forKey: privateApiDisabledKey)
+        UserDefaults.standard.set(false, forKey: privateApiInUseKey)
+
+        let alert = NSAlert()
+        alert.messageText = "Focus workaround disabled due to crash"
+        alert.informativeText = """
+            AeroSpace uses a private API to fix window focus across multiple monitors. \
+            A crash was detected during the last session, so this workaround has been disabled. \
+            Window focus may not work correctly with multiple monitors until you report this issue.
+            """
+        alert.runModal()
+    }
+}
+
 @MainActor public func initAppBundle() {
+    checkFocusPrivateApiCrashGuard()
     Task.startUnstructured {
         initTerminationHandler()
         unsafe _isCli = false

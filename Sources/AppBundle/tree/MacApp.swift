@@ -1,6 +1,33 @@
 import AppKit
 import Common
 
+// MARK: - Private API declarations for cross-monitor window focus
+// These bypass the broken public accessibility API (kAXMainAttribute + kAXRaise)
+// which fails to focus the correct window of the same app across different monitors
+// when "Displays have separate Spaces" is enabled.
+//
+// References:
+//   - yabai: https://github.com/koekeishiya/yabai (src/window_manager.c:1293-1322)
+//   - Amethyst: https://github.com/ianyh/Amethyst (Amethyst/Model/Window.swift:317-365)
+//   - Hammerspoon issue: https://github.com/Hammerspoon/hammerspoon/issues/370
+//   - AeroSpace issue: https://github.com/nikitabobko/AeroSpace/issues/101
+
+@_silgen_name("GetProcessForPID") @discardableResult
+func _getProcessForPID(_ pid: pid_t, _ psn: inout ProcessSerialNumber) -> OSStatus
+
+@_silgen_name("_SLPSSetFrontProcessWithOptions") @discardableResult
+func _slpsSetFrontProcessWithOptions(_ psn: inout ProcessSerialNumber, _ wid: UInt32, _ mode: UInt32) -> CGError
+
+@_silgen_name("SLPSPostEventRecordTo") @discardableResult
+func _slpsPostEventRecordTo(_ psn: inout ProcessSerialNumber, _ bytes: inout UInt8) -> CGError
+
+private let cpsUserGenerated: UInt32 = 0x200
+
+// UserDefaults keys for the crash guard (see nikitabobko's plan:
+// https://github.com/nikitabobko/AeroSpace/issues/101#issuecomment-2568238564)
+let privateApiInUseKey = "aeroSpace-private-focus-in-progress"
+let privateApiDisabledKey = "aeroSpace-private-focus-disabled"
+
 // Potential alternative implementation
 // https://github.com/swiftlang/swift-evolution/blob/main/proposals/0392-custom-actor-executors.md
 // (only available since macOS 14)
@@ -111,9 +138,60 @@ final class MacApp: AbstractApp {
         return try await MacWindow.getOrRegister(windowId: windowId, macApp: self)
     }
 
+    @MainActor private func nativeFocusWithPrivateApi(_ windowId: UInt32) {
+        guard !UserDefaults.standard.bool(forKey: privateApiDisabledKey) else { return }
+
+        defer { UserDefaults.standard.set(false, forKey: privateApiInUseKey) }
+        UserDefaults.standard.set(true, forKey: privateApiInUseKey)
+
+        var psn = ProcessSerialNumber()
+        let status = _getProcessForPID(pid, &psn)
+        guard status == 0 else { return }
+
+        // Tell the WindowServer to set this process+window combo as frontmost
+        _slpsSetFrontProcessWithOptions(&psn, windowId, cpsUserGenerated)
+
+        // Send synthetic WindowServer control events that make the target window the key window.
+        // The byte layout was reverse-engineered from macOS's own behavior (Ctrl+Alt+click).
+        // Format:
+        //   [0x04] = 0xF8       -- magic marker
+        //   [0x08] = event type  -- 0x01 = activate, 0x02 = update
+        //   [0x3a] = 0x10       -- control flag
+        //   [0x3c] = windowId   -- target window ID (4 bytes, little-endian)
+        //   [0x20..0x30] = 0xFF -- padding
+        // See https://github.com/Hammerspoon/hammerspoon/issues/370#issuecomment-545545468
+        for eventType: UInt8 in [0x01, 0x02] {
+            var bytes = [UInt8](repeating: 0, count: 0xf8)
+            bytes[0x04] = 0xf8
+            bytes[0x08] = eventType
+            bytes[0x3a] = 0x10
+            withUnsafeMutableBytes(of: &bytes[0x3c]) { $0.storeBytes(of: windowId, as: UInt32.self) }
+            withUnsafeMutableBytes(of: &bytes[0x20]) { $0.copyMemory(from: Data(repeating: 0xff, count: 0x10)) }
+            bytes.withUnsafeMutableBufferPointer { buf in
+                _slpsPostEventRecordTo(&psn, &buf.baseAddress!.pointee)
+            }
+        }
+
+        // Belt-and-suspenders: raise the window via public AX API
+        MacApp.focusJob = withWindowAsync(windowId) { window, _ in
+            AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+        }
+    }
+
     @MainActor func nativeFocus(_ windowId: UInt32) {
         if serverArgs.isReadOnly { return }
         MacApp.focusJob?.cancel()
+
+        // When "Displays have separate Spaces" is enabled with multiple monitors,
+        // the public accessibility API (kAXMainAttribute + kAXRaise) is unreliable
+        // for focusing the correct window of the same app across different monitors.
+        // Use private SkyLight APIs as a workaround.
+        // https://github.com/nikitabobko/AeroSpace/issues/101
+        if NSScreen.screensHaveSeparateSpaces && monitors.count > 1 && !UserDefaults.standard.bool(forKey: privateApiDisabledKey) {
+            nativeFocusWithPrivateApi(windowId)
+            return
+        }
+
         // Performance optimization. If possible avoid doing AX requests
         // (important for apps which are slow at responding even such basic AX requests. E.g. Godot)
         // Beware of the macOS bug: https://github.com/nikitabobko/AeroSpace/issues/101
